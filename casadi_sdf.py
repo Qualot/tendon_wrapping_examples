@@ -74,61 +74,32 @@ def convert_to_casadi_sdf(skrobot_sdf):
         for child_f in child_functions[1:]:
             sd_val = ca.fmin(sd_val, child_f(p_world))
 
-    # --- Case 5: GridSDF (Pure Trilinear Interpolation Formula) ---
+    # --- Case 5: GridSDF (Using fast built-in CasADi interpolant) ---
     elif isinstance(skrobot_sdf, GridSDF):
         data = skrobot_sdf._data        # 3D numpy array
         res = skrobot_sdf._resolution   # float
         origin = skrobot_sdf.origin     # length 3 array
         
-        # Convert local coordinates to raw grid indices (float)
-        idx_raw = (p_local - ca.MX(origin)) / res
+        # 1. Generate grid coordinates for each axis (list of 1D arrays)
+        # Note: Please adjust this if the data ordering (XYZ) of skrobot's GridSDF requires it.
+        nx, ny, nz = data.shape
+        x_grid = origin[0] + np.arange(nx) * res
+        y_grid = origin[1] + np.arange(ny) * res
+        z_grid = origin[2] + np.arange(nz) * res
         
-        # Clamp indices to stay within grid boundaries
-        max_idx = ca.MX([float(data.shape[0]-2), float(data.shape[1]-2), float(data.shape[2]-2)])
-        idx_clamped = ca.fmax(0.0, ca.fmin(max_idx, idx_raw))
+        # 2. Flatten the data (CasADi's interpolant expects 'fortran' (F) order or a specific layout)
+        # For typical bspline/linear interpolation, ravel(order='F') is often used.
+        # If the signs or values of the result are misaligned, please check the supplementary notes.
+        flat_data = data.ravel(order='F')
         
-        # Get integer part of the indices using floor function
-        idx_f = ca.floor(idx_clamped)
+        # 3. Create CasADi interpolant (linear lookup table)
+        # This function is optimized on the C++ side, eliminating symbolic index access overhead.
+        interp_name = f"sdf_interp_{id(skrobot_sdf)}"  # Unique name to avoid duplication
+        sdf_interp = ca.interpolant(interp_name, 'linear', [x_grid, y_grid, z_grid], flat_data)
         
-        # Calculate interpolation ratios t (0.0 <= t <= 1.0)
-        t = idx_clamped - idx_f
-        tx, ty, tz = t[0], t[1], t[2]
-        
-        # Flatten the 3D grid data in 'C' order (matching SciPy's internal layout)
-        flat_data_np = data.ravel(order='C')
-        ca_data_table = ca.MX(flat_data_np)
-        
-        # Strides for 3D-to-1D index conversion
-        stride_x = data.shape[1] * data.shape[2]
-        stride_y = data.shape[2]
-        
-        def get_val(nx, ny, nz):
-            cur_x = idx_f[0] + nx
-            cur_y = idx_f[1] + ny
-            cur_z = idx_f[2] + nz
-            flat_idx = cur_x * stride_x + cur_y * stride_y + cur_z
-            return ca_data_table[flat_idx]
-            
-        # Fetch values from the 8 surrounding grid vertices
-        c000 = get_val(0, 0, 0)
-        c001 = get_val(0, 0, 1)
-        c010 = get_val(0, 1, 0)
-        c011 = get_val(0, 1, 1)
-        c100 = get_val(1, 0, 0)
-        c101 = get_val(1, 0, 1)
-        c110 = get_val(1, 1, 0)
-        c111 = get_val(1, 1, 1)
-        
-        # Step-by-step Trilinear Interpolation
-        c00 = c000 * (1 - tx) + c100 * tx
-        c01 = c001 * (1 - tx) + c101 * tx
-        c10 = c010 * (1 - tx) + c110 * tx
-        c11 = c011 * (1 - tx) + c111 * tx
-        
-        c0 = c00 * (1 - ty) + c10 * ty
-        c1 = c01 * (1 - ty) + c11 * ty
-        
-        sd_val = c0 * (1 - tz) + c1 * tz
+        # 4. Pass local coordinates to the interpolant as a column vector
+        # Since the interpolant accepts input as a (3, N) matrix, p_local is formatted as a column vector.
+        sd_val = sdf_interp(p_local)
 
     else:
         raise NotImplementedError(f"SDF type {type(skrobot_sdf)} is not supported.")
